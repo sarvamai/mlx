@@ -4,6 +4,7 @@
 
 #include <Metal/Metal.hpp>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -18,6 +19,13 @@ namespace mlx::core::metal {
 
 using MTLFCList =
     std::vector<std::tuple<const void*, MTL::DataType, NS::UInteger>>;
+
+struct KernelStats {
+  uint64_t count{0};
+  double total_us{0.0};
+  double min_us{std::numeric_limits<double>::max()};
+  double max_us{0.0};
+};
 
 class Device;
 
@@ -56,9 +64,7 @@ class MLX_API CommandEncoder {
   void dispatch_threads(MTL::Size grid_dims, MTL::Size group_dims);
   void maybeInsertBarrier();
 
-  void set_compute_pipeline_state(MTL::ComputePipelineState* kernel) {
-    get_command_encoder()->setComputePipelineState(kernel);
-  }
+  void set_compute_pipeline_state(MTL::ComputePipelineState* kernel);
 
   template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
   void set_vector_bytes(const Vec& vec, size_t nelems, int idx) {
@@ -130,6 +136,7 @@ class MLX_API CommandEncoder {
   // A map of prior command encoder outputs to their corresponding fence.
   std::unordered_map<const void*, NS::SharedPtr<MTL::Fence>> prev_ce_outputs_;
   std::mutex outputs_mtx_;
+  std::string current_kernel_name_;
 };
 
 class MLX_API Device {
@@ -180,6 +187,15 @@ class MLX_API Device {
     return residency_set_;
   }
 
+  void enable_profiling();
+  void disable_profiling();
+  bool profiling_enabled() const;
+  void record_kernel_time(const std::string& name, double us);
+  std::unordered_map<std::string, KernelStats> get_kernel_stats() const;
+  void reset_kernel_stats();
+  void register_kernel_name(MTL::ComputePipelineState* k, const std::string& name);
+  std::string get_kernel_name(MTL::ComputePipelineState* k) const;
+
  private:
   NS::SharedPtr<MTL::Library> build_library_(const std::string& source_string);
 
@@ -225,6 +241,11 @@ class MLX_API Device {
   int arch_gen_;
   int max_ops_per_buffer_;
   int max_mb_per_buffer_;
+
+  bool profiling_enabled_{false};
+  std::unordered_map<std::string, KernelStats> kernel_stats_;
+  std::unordered_map<MTL::ComputePipelineState*, std::string> kernel_name_map_;
+  mutable std::mutex profiling_mtx_;
 };
 
 MLX_API Device& device(mlx::core::Device);

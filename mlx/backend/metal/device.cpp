@@ -369,6 +369,14 @@ void CommandEncoder::dispatch_threads(
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
 }
 
+void CommandEncoder::set_compute_pipeline_state(
+    MTL::ComputePipelineState* kernel) {
+  get_command_encoder()->setComputePipelineState(kernel);
+  if (device_.profiling_enabled()) {
+    current_kernel_name_ = device_.get_kernel_name(kernel);
+  }
+}
+
 void CommandEncoder::barrier() {
   get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
 }
@@ -443,11 +451,24 @@ void CommandEncoder::end_encoding() {
 }
 
 bool CommandEncoder::needs_commit() const {
+  if (device_.profiling_enabled() && buffer_ops_ > 0) {
+    return true;
+  }
   auto [max_ops, max_mb] = device_.get_max_ops_mb_per_buffer();
   return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
 }
 
 void CommandEncoder::commit() {
+  if (device_.profiling_enabled() && !current_kernel_name_.empty()) {
+    auto kernel_name = current_kernel_name_;
+    auto& dev = device_;
+    buffer_->addCompletedHandler(
+        [kernel_name, &dev](MTL::CommandBuffer* cb) {
+          double us = (cb->GPUEndTime() - cb->GPUStartTime()) * 1e6;
+          dev.record_kernel_time(kernel_name, us);
+        });
+    current_kernel_name_.clear();
+  }
   buffer_->commit();
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
@@ -523,6 +544,52 @@ Device::Device() : device_(load_device()), residency_set_(device_.get()) {
 }
 
 Device::~Device() = default;
+
+void Device::enable_profiling() {
+  std::lock_guard<std::mutex> lk(profiling_mtx_);
+  profiling_enabled_ = true;
+}
+
+void Device::disable_profiling() {
+  std::lock_guard<std::mutex> lk(profiling_mtx_);
+  profiling_enabled_ = false;
+}
+
+bool Device::profiling_enabled() const {
+  return profiling_enabled_;
+}
+
+void Device::record_kernel_time(const std::string& name, double us) {
+  std::lock_guard<std::mutex> lk(profiling_mtx_);
+  auto& s = kernel_stats_[name];
+  s.count++;
+  s.total_us += us;
+  s.min_us = std::min(s.min_us, us);
+  s.max_us = std::max(s.max_us, us);
+}
+
+std::unordered_map<std::string, KernelStats> Device::get_kernel_stats() const {
+  std::lock_guard<std::mutex> lk(profiling_mtx_);
+  return kernel_stats_;
+}
+
+void Device::reset_kernel_stats() {
+  std::lock_guard<std::mutex> lk(profiling_mtx_);
+  kernel_stats_.clear();
+}
+
+void Device::register_kernel_name(
+    MTL::ComputePipelineState* k,
+    const std::string& name) {
+  std::lock_guard<std::mutex> lk(profiling_mtx_);
+  kernel_name_map_[k] = name;
+}
+
+std::string Device::get_kernel_name(MTL::ComputePipelineState* k) const {
+  std::lock_guard<std::mutex> lk(profiling_mtx_);
+  auto it = kernel_name_map_.find(k);
+  return it != kernel_name_map_.end() ? it->second : "";
+}
 
 MTL::Library* Device::get_library(
     const std::string& name,
@@ -772,6 +839,7 @@ MTL::ComputePipelineState* Device::get_kernel(
     const MTLFCList& func_consts /* = {} */,
     const std::vector<MTL::Function*>& linked_functions /* = {} */) {
   const auto& kname = hash_name.empty() ? base_name : hash_name;
+  MTL::ComputePipelineState* result = nullptr;
   {
     // Multiple readers allowed
     std::shared_lock lock(kernel_mtx_);
@@ -779,10 +847,16 @@ MTL::ComputePipelineState* Device::get_kernel(
     // Look for cached kernel
     auto& kernel_map_ = library_kernels_[mtl_lib];
     if (auto it = kernel_map_.find(kname); it != kernel_map_.end()) {
-      return it->second.get();
+      result = it->second.get();
     }
   }
-  return get_kernel_(base_name, mtl_lib, kname, func_consts, linked_functions);
+  if (!result) {
+    result = get_kernel_(base_name, mtl_lib, kname, func_consts, linked_functions);
+  }
+  if (profiling_enabled()) {
+    register_kernel_name(result, base_name);
+  }
+  return result;
 }
 
 MTL::ComputePipelineState* Device::get_kernel(
@@ -844,6 +918,26 @@ bool is_nax_available() {
   static bool is_nax_available_ = _check_nax();
   return is_nax_available_;
 #endif
+}
+
+void enable_profiling() {
+  device(mlx::core::Device::gpu).enable_profiling();
+}
+
+void disable_profiling() {
+  device(mlx::core::Device::gpu).disable_profiling();
+}
+
+bool profiling_enabled() {
+  return device(mlx::core::Device::gpu).profiling_enabled();
+}
+
+std::unordered_map<std::string, KernelStats> get_kernel_stats() {
+  return device(mlx::core::Device::gpu).get_kernel_stats();
+}
+
+void reset_kernel_stats() {
+  device(mlx::core::Device::gpu).reset_kernel_stats();
 }
 
 } // namespace mlx::core::metal
